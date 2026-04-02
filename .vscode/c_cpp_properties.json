@@ -1,0 +1,24 @@
+{
+  "configurations": [
+    {
+      "name": "Arduino UNO R4 WiFi",
+      "includePath": [
+        "${workspaceFolder}/**",
+        "C:/Users/marti/AppData/Local/Arduino15/packages/arduino/hardware/renesas_uno/1.5.2/cores/arduino",
+        "C:/Users/marti/AppData/Local/Arduino15/packages/arduino/hardware/renesas_uno/1.5.2/variants/UNOWIFIR4",
+        "C:/Users/marti/AppData/Local/Arduino15/packages/arduino/hardware/renesas_uno/1.5.2/libraries/**",
+        "C:/Users/marti/Documents/Arduino/libraries/**"
+      ],
+      "defines": [
+        "ARDUINO=10816",
+        "ARDUINO_UNOWIFIR4",
+        "F_CPU=48000000L"
+      ],
+      "compilerPath": "",
+      "cStandard": "c17",
+      "cppStandard": "c++17",
+      "intelliSenseMode": "gcc-arm"
+    }
+  ],
+  "version": 4
+}

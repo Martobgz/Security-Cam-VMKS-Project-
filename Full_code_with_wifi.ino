@@ -1,177 +1,300 @@
+/*
+  Arduino UNO R4 WiFi — Security Camera Node
+  Sensors : PIR, MQ2 (LPG/CO/Smoke), Photoresistor
+  Actuators: Servo, Buzzer
+  - Pushes motion/gas ALERTS to Flask immediately (no polling lag)
+  - Polls Flask every 500 ms for servo commands from the app
+  - Serves GET /data for Flask scraper
+*/
+
 #include <WiFiS3.h>
 #include <Servo.h>
 #include "MQ2.h"
 #include "secrets.h"
 
 // ---------- PINS ----------
-const int pirPin = 5;
-const int mqPin = A0;
-const int photoresPin = A1;
-const int buzzer = 10;
-const int servoPin = 9;
+const int PIR_PIN    = 5;
+const int MQ2_PIN    = A0;
+const int PHOTO_PIN  = A1;
+const int BUZZER_PIN = 10;
+const int SERVO_PIN  = 9;
 
-// ---------- SENSORS ----------
-MQ2 mq2(mqPin);
+// ---------- ALERT THRESHOLDS ----------
+const int LPG_THRESHOLD   = 1000;  // ppm
+const int CO_THRESHOLD    = 50;    // ppm
+const int SMOKE_THRESHOLD = 300;   // ppm
+
+// ---------- TIMING (ms) ----------
+const unsigned long MOTION_COOLDOWN   =  10000;
+const unsigned long GAS_COOLDOWN      =  60000;  // 1 minute between repeat alerts
+const unsigned long MQ2_WARMUP        =  60000;  // 1 minute calibration on boot
+const unsigned long COMMAND_INTERVAL  =    500;
+const unsigned long SENSOR_INTERVAL   =   2000;
+
+// ---------- OBJECTS ----------
+MQ2   mq2(MQ2_PIN);
 Servo myservo;
 
-// ---------- VARIABLES ----------
-int sensorValue;
-int threshold = 650;
-int servoPos = 0;
+// ---------- STATE ----------
+bool          registered    = false;
+int           servoPos      = 90;
+unsigned long lastMotionAlert  = 0;
+unsigned long lastGasAlert     = 0;
+unsigned long lastCommandPoll  = 0;
+unsigned long lastSensorRead   = 0;
+bool          pirLastState     = LOW;
 
-// ---------- WIFI ----------
-bool registered = false;
+// ---------- HTTP SERVER ----------
 WiFiServer server(80);
-WiFiClient client;
 
-// ---------- FUNCTIONS ----------
+// =====================================================================
+//  HTTP HELPERS
+// =====================================================================
 
-// Connect to WiFi
+// Returns true on HTTP 2xx; drains response body.
+bool httpPost(const char* path, const String& payload) {
+  WiFiClient c;
+  if (!c.connect(FLASK_IP, FLASK_PORT)) {
+    Serial.println("[POST] connect failed");
+    return false;
+  }
+
+  c.println(String("POST ") + path + " HTTP/1.1");
+  c.println(String("Host: ") + FLASK_IP);
+  c.println("Content-Type: application/json");
+  c.println("Connection: close");
+  c.print("Content-Length: ");
+  c.println(payload.length());
+  c.println();
+  c.print(payload);
+
+  unsigned long t = millis();
+  while (!c.available()) {
+    if (millis() - t > 4000) { c.stop(); return false; }
+    delay(10);
+  }
+  while (c.available()) c.read();
+  c.stop();
+  return true;
+}
+
+// Returns response body (after headers); empty string on failure.
+String httpGet(const char* path) {
+  WiFiClient c;
+  if (!c.connect(FLASK_IP, FLASK_PORT)) return "";
+
+  c.println(String("GET ") + path + " HTTP/1.1");
+  c.println(String("Host: ") + FLASK_IP);
+  c.println("Connection: close");
+  c.println();
+
+  unsigned long t = millis();
+  while (!c.available()) {
+    if (millis() - t > 3000) { c.stop(); return ""; }
+    delay(10);
+  }
+
+  // Skip headers — body starts after blank line (\r\n\r\n)
+  bool inBody = false;
+  String body = "";
+  while (c.available()) {
+    String line = c.readStringUntil('\n');
+    if (!inBody) {
+      if (line == "\r") inBody = true;
+    } else {
+      body += line;
+    }
+  }
+  c.stop();
+  body.trim();
+  return body;
+}
+
+// =====================================================================
+//  WIFI
+// =====================================================================
 void connectWiFi() {
-  Serial.print("Connecting to WiFi: ");
-  Serial.println(WIFI_SSID);
-
+  Serial.print("Connecting to WiFi");
   WiFi.begin(WIFI_SSID, WIFI_PASS);
-
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
-    attempts++;
-    if (attempts > 60) {
-      Serial.println("\nFailed to connect WiFi, restarting...");
-      NVIC_SystemReset(); // reboot UNO R4
+    if (++attempts > 60) {
+      Serial.println("\nWiFi timeout — rebooting");
+      NVIC_SystemReset();
     }
   }
-
-  Serial.println("\nWiFi connected!");
-  Serial.print("IP: ");
+  Serial.print("\nIP: ");
   Serial.println(WiFi.localIP());
 }
 
-// Register device to Flask
+// =====================================================================
+//  REGISTRATION
+// =====================================================================
 bool registerDevice() {
-  if (WiFi.status() != WL_CONNECTED) return false;
-
-  String payload = "{\"ip\":\"" + WiFi.localIP().toString() + "\",\"name\":\"UNO_R4\"}";
-  String host = String(FLASK_IP);
-  int port = FLASK_PORT;
-
-  if (!client.connect(host.c_str(), port)) {
-    Serial.println("Connection failed");
-    return false;
-  }
-
-  // Manual HTTP POST
-  client.println("POST /register HTTP/1.1");
-  client.println("Host: " + host);
-  client.println("Content-Type: application/json");
-  client.print("Content-Length: ");
-  client.println(payload.length());
-  client.println();
-  client.println(payload);
-
-  // Wait for response
-  long timeout = millis();
-  while (!client.available()) {
-    if (millis() - timeout > 5000) {
-      Serial.println("Server response timeout");
-      client.stop();
-      return false;
-    }
-  }
-
-  while (client.available()) {
-    String line = client.readStringUntil('\r');
-    Serial.print(line);
-  }
-
-  client.stop();
-  return true;
+  String payload = "{\"ip\":\"" + WiFi.localIP().toString() +
+                   "\",\"name\":\"UNO_R4\",\"type\":\"sensor\"}";
+  return httpPost("/register", payload);
 }
 
-// Read sensors and return JSON
+// =====================================================================
+//  SENSORS
+// =====================================================================
 String readSensorsJSON() {
-  int pirState = digitalRead(pirPin);
-  int lpg = mq2.readLPG();
-  int co = mq2.readCO();
-  int smoke = mq2.readSmoke();
-  int light = analogRead(photoresPin);
-
-  String json = "{";
-  json += "\"motion\":" + String(pirState) + ",";
-  json += "\"lpg\":" + String(lpg) + ",";
-  json += "\"co\":" + String(co) + ",";
-  json += "\"smoke\":" + String(smoke) + ",";
-  json += "\"light\":" + String(light);
-  json += "}";
-  return json;
+  return "{\"motion\":"  + String(digitalRead(PIR_PIN)) +
+         ",\"lpg\":"     + String(mq2.readLPG())        +
+         ",\"co\":"      + String(mq2.readCO())         +
+         ",\"smoke\":"   + String(mq2.readSmoke())      +
+         ",\"light\":"   + String(analogRead(PHOTO_PIN))+
+         ",\"servo\":"   + String(servoPos)             + "}";
 }
 
-// ---------- SETUP ----------
+// =====================================================================
+//  ALERTS
+// =====================================================================
+void sendMotionAlert() {
+  String p = "{\"type\":\"motion\",\"device\":\"UNO_R4\"}";
+  if (httpPost("/alert", p))
+    Serial.println("[ALERT] Motion sent to Flask");
+}
+
+void sendGasAlert(const String& gasType, int ppm) {
+  String p = "{\"type\":\"gas\",\"gas\":\"" + gasType +
+             "\",\"ppm\":" + String(ppm) + ",\"device\":\"UNO_R4\"}";
+  if (httpPost("/alert", p)) {
+    Serial.print("[ALERT] Gas: ");
+    Serial.print(gasType);
+    Serial.print(" ");
+    Serial.print(ppm);
+    Serial.println(" ppm");
+  }
+}
+
+// =====================================================================
+//  SERVO COMMAND POLL
+// =====================================================================
+void pollCommand() {
+  String body = httpGet("/command/UNO_R4");
+  if (body.length() == 0) return;
+
+  // Parse {"servo":90} or {"servo":null}
+  int idx = body.indexOf("\"servo\":");
+  if (idx < 0) return;
+  String val = body.substring(idx + 8);
+  val.trim();
+  if (val.startsWith("null")) return;
+
+  int angle = val.toInt();
+  if (angle >= 0 && angle <= 180) {
+    servoPos = angle;
+    myservo.write(servoPos);
+    Serial.print("[SERVO] -> ");
+    Serial.println(servoPos);
+  }
+}
+
+// =====================================================================
+//  HTTP SERVER  (serves /data for Flask scraper)
+// =====================================================================
+void handleHTTPServer() {
+  WiFiClient clientTCP = server.available();
+  if (!clientTCP) return;
+
+  String request = clientTCP.readStringUntil('\r');
+  clientTCP.flush();
+
+  if (request.indexOf("GET /data") >= 0) {
+    String body = readSensorsJSON();
+    clientTCP.println("HTTP/1.1 200 OK");
+    clientTCP.println("Content-Type: application/json");
+    clientTCP.println("Connection: close");
+    clientTCP.println();
+    clientTCP.print(body);
+  }
+
+  delay(5);
+  clientTCP.stop();
+}
+
+// =====================================================================
+//  SETUP
+// =====================================================================
 void setup() {
   Serial.begin(9600);
-  delay(2000);
+  delay(1000);
 
-  // Sensors
-  pinMode(pirPin, INPUT);
-  pinMode(buzzer, OUTPUT);
+  pinMode(PIR_PIN,    INPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+
   mq2.begin();
-  myservo.attach(servoPin);
+  myservo.attach(SERVO_PIN);
+  myservo.write(servoPos);   // start centered at 90°
 
-  // Connect WiFi
   connectWiFi();
-
-  // Start local TCP server for /data endpoint
   server.begin();
-  Serial.println("Server started, listening on port 80");
+  Serial.println("HTTP server on port 80");
 }
 
-// ---------- LOOP ----------
+// =====================================================================
+//  LOOP
+// =====================================================================
 void loop() {
-  // Try register until success
+  // ---------- WiFi watchdog ----------
+  if (WiFi.status() != WL_CONNECTED) {
+    connectWiFi();
+    registered = false;
+  }
+
+  // ---------- Registration ----------
   if (!registered) {
     registered = registerDevice();
-    delay(3000);
+    if (!registered) { delay(3000); return; }
+    Serial.println("[REGISTERED]");
   }
 
-  // Read sensors and print JSON to serial
-  String json = readSensorsJSON();
-  Serial.println(json);
+  unsigned long now = millis();
 
-  // Serve /data endpoint
-  WiFiClient clientTCP = server.available();
-  if (clientTCP) {
-    String request = clientTCP.readStringUntil('\r');
-    clientTCP.flush();
+  // ---------- PIR — edge-triggered ----------
+  bool pirNow = digitalRead(PIR_PIN);
+  if (pirNow && !pirLastState && (now - lastMotionAlert > MOTION_COOLDOWN)) {
+    lastMotionAlert = now;
+    tone(BUZZER_PIN, 1000, 300);
+    sendMotionAlert();
+  }
+  pirLastState = pirNow;
 
-    if (request.indexOf("GET /data") >= 0) {
-      String response = readSensorsJSON();
-      clientTCP.println("HTTP/1.1 200 OK");
-      clientTCP.println("Content-Type: application/json");
-      clientTCP.println("Connection: close");
-      clientTCP.println();
-      clientTCP.println(response);
+  // ---------- Gas reading ----------
+  if (now - lastSensorRead >= SENSOR_INTERVAL) {
+    lastSensorRead = now;
+
+    int lpg   = mq2.readLPG();
+    int co    = mq2.readCO();
+    int smoke = mq2.readSmoke();
+
+    // Skip alerting during the 1-minute warm-up (sensor calibration)
+    if (now < MQ2_WARMUP) {
+      Serial.println("[MQ2] warming up...");
+    } else if (now - lastGasAlert > GAS_COOLDOWN) {
+      bool fired = false;
+      if (lpg   > 0 && lpg   > LPG_THRESHOLD)   { sendGasAlert("LPG",   lpg);   fired = true; }
+      if (co    > 0 && co    > CO_THRESHOLD)     { sendGasAlert("CO",    co);    fired = true; }
+      if (smoke > 0 && smoke > SMOKE_THRESHOLD)  { sendGasAlert("Smoke", smoke); fired = true; }
+      if (fired) {
+        lastGasAlert = now;
+        tone(BUZZER_PIN, 2000, 2000);
+      }
     }
-
-    clientTCP.stop();
   }
 
-  // Buzzer test
-  tone(buzzer, 1000);
-  delay(1000);
-  noTone(buzzer);
-  delay(1000);
-
-  // Servo sweep
-  for (servoPos = 0; servoPos <= 180; servoPos += 1) {
-    myservo.write(servoPos);
-    delay(15);
-  }
-  for (servoPos = 180; servoPos >= 0; servoPos -= 1) {
-    myservo.write(servoPos);
-    delay(15);
+  // ---------- Servo command poll ----------
+  if (now - lastCommandPoll >= COMMAND_INTERVAL) {
+    lastCommandPoll = now;
+    pollCommand();
   }
 
-  delay(2000); // main loop pacing
+  // ---------- HTTP server ----------
+  handleHTTPServer();
+
+  delay(10);
 }
