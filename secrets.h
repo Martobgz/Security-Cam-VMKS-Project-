@@ -2,11 +2,11 @@
 #define SECRETS_H
 
 // WIFI
-#define WIFI_SSID "ZTE_69E7AD"
-#define WIFI_PASS "4F27F72D6D"
+#define WIFI_SSID "SSID"
+#define WIFI_PASS "PASSWORD"
 
 // Flask server (your PC IP)
-#define FLASK_IP "192.168.0.77"
-#define FLASK_PORT 5000
+#define FLASK_IP "PCIP"
+#define FLASK_PORT PCPORT
 
 #endif
