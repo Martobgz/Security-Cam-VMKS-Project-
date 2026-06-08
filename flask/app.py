@@ -26,13 +26,14 @@ load_dotenv()
 HOST            = os.getenv("FLASK_HOST",     "0.0.0.0")
 PORT            = int(os.getenv("FLASK_PORT", "5000"))
 SCRAPE_INTERVAL = int(os.getenv("SCRAPE_INTERVAL", "2"))
-DEVICE_TIMEOUT  = int(os.getenv("DEVICE_TIMEOUT",  "30"))
+DEVICE_TIMEOUT  = int(os.getenv("DEVICE_TIMEOUT",  "60"))
 
 app = Flask(__name__)
 
 # ── shared state ──────────────────────────────────────────────────────
-devices         = {}          # ip  → {name, type, last_seen}
-latest_data     = {}          # ip  → sensor dict
+devices          = {}          # ip  → {name, type, last_seen}
+latest_data      = {}          # ip  → sensor dict
+detection_enabled = False      # controlled by app toggle
 pending_cmds    = {}          # device_name → {"servo": angle | None}
 push_tokens     = []          # Expo push token strings
 alert_history   = deque(maxlen=50)   # last 50 alerts
@@ -81,37 +82,45 @@ def _detect_and_notify(alert_type: str, extra: dict):
     """
     Background worker: grab a camera snapshot, run person detection,
     then fire the appropriate push notification.
+    - Motion alerts only run when detection_enabled is True.
+    - Gas alerts always notify regardless of the toggle.
     """
+    global detection_enabled
+
     try:
-        from person_detector import detect_person
-
-        cam_ip = get_camera_ip()
-        if cam_ip:
-            r = requests.get(f"http://{cam_ip}/capture", timeout=5)
-            if r.status_code == 200:
-                is_person = detect_person(r.content)
-                if alert_type == "motion":
-                    if is_person:
-                        send_push_notification(
-                            "Person Detected",
-                            "Movement detected — a person is in the frame.",
-                            {"type": "person"},
-                        )
-                    else:
-                        send_push_notification(
-                            "Motion Detected",
-                            "Movement detected — no person identified.",
-                            {"type": "motion"},
-                        )
-                    return
-
-        # Camera unavailable or snapshot failed — send basic notification
         if alert_type == "motion":
-            send_push_notification(
-                "Motion Detected",
-                "The PIR sensor triggered.",
-                {"type": "motion"},
-            )
+            if not detection_enabled:
+                return  # toggle is off — ignore motion alerts
+
+            from person_detector import detect_person
+
+            cam_ip = get_camera_ip()
+            if not cam_ip:
+                print("[DETECT] no camera available for person detection")
+                return
+
+            r = requests.get(f"http://{cam_ip}/capture", timeout=5)
+            if r.status_code != 200:
+                print("[DETECT] snapshot failed")
+                return
+
+            is_person = detect_person(r.content)
+            if is_person:
+                entry = {
+                    "type":      "person",
+                    "device":    extra.get("device", "unknown"),
+                    "timestamp": time.time(),
+                }
+                with _lock:
+                    alert_history.appendleft(entry)
+                send_push_notification(
+                    "Person Detected",
+                    "Movement detected — a person is in the frame.",
+                    {"type": "person"},
+                )
+            else:
+                print("[DETECT] motion detected but no person found — no alert sent")
+
         elif alert_type == "gas":
             gas = extra.get("gas", "Unknown")
             ppm = extra.get("ppm", "?")
@@ -120,11 +129,9 @@ def _detect_and_notify(alert_type: str, extra: dict):
                 f"{gas} at {ppm} ppm — check the area immediately!",
                 {"type": "gas", "gas": gas, "ppm": ppm},
             )
+
     except Exception as e:
         print(f"[DETECT] error: {e}")
-        # Send fallback notification
-        if alert_type == "motion":
-            send_push_notification("Motion Detected", "PIR sensor triggered.", {"type": "motion"})
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -160,27 +167,28 @@ def alert():
     alert_type  = data.get("type")   # "motion" or "gas"
     device      = data.get("device", "unknown")
 
-    entry = {**data, "timestamp": time.time()}
-    with _lock:
-        alert_history.appendleft(entry)
-
     print(f"[ALERT] {alert_type} from {device}")
 
-    # Handle gas alerts immediately without camera detection
     if alert_type == "gas":
-        gas = data.get("gas", "Unknown")
-        ppm = data.get("ppm", "?")
+        # Gas alerts always go to history and always notify
+        entry = {**data, "timestamp": time.time()}
+        with _lock:
+            alert_history.appendleft(entry)
         threading.Thread(
             target=_detect_and_notify,
-            args=("gas", {"gas": gas, "ppm": ppm}),
+            args=("gas", {"gas": data.get("gas", "Unknown"), "ppm": data.get("ppm", "?")}),
             daemon=True,
         ).start()
+
     elif alert_type == "motion":
-        threading.Thread(
-            target=_detect_and_notify,
-            args=("motion", {}),
-            daemon=True,
-        ).start()
+        # Motion only processed when detection switch is ON.
+        # History and notification are added only after person is confirmed.
+        if detection_enabled:
+            threading.Thread(
+                target=_detect_and_notify,
+                args=("motion", {"device": device}),
+                daemon=True,
+            ).start()
 
     return {"status": "ok"}
 
@@ -197,9 +205,9 @@ def set_servo():
         return {"error": "angle must be 0-180"}, 400
 
     with _lock:
-        if "UNO_R4" not in pending_cmds:
-            pending_cmds["UNO_R4"] = {}
-        pending_cmds["UNO_R4"]["servo"] = int(angle)
+        if "ESP32_S3" not in pending_cmds:
+            pending_cmds["ESP32_S3"] = {}
+        pending_cmds["ESP32_S3"]["servo"] = int(angle)
 
     print(f"[SERVO] queued angle={angle}")
     return {"status": "queued", "angle": angle}
@@ -215,6 +223,24 @@ def get_command(device_name):
         if device_name in pending_cmds:
             pending_cmds[device_name]["servo"] = None
     return jsonify({"servo": servo})
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  PERSON DETECTION TOGGLE  (called by app)
+# ══════════════════════════════════════════════════════════════════════
+
+@app.route("/set-detection", methods=["POST"])
+def set_detection():
+    global detection_enabled
+    data = request.json or {}
+    detection_enabled = bool(data.get("enabled", False))
+    print(f"[DETECTION] {'enabled' if detection_enabled else 'disabled'}")
+    return {"status": "ok", "enabled": detection_enabled}
+
+
+@app.route("/detection-status")
+def detection_status():
+    return jsonify({"enabled": detection_enabled})
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -272,7 +298,7 @@ def camera_url():
     if not cam_ip:
         return jsonify({"stream": None, "snapshot": None})
     return jsonify({
-        "stream":   f"http://{cam_ip}/stream",
+        "stream":   f"http://{cam_ip}:81/stream",
         "snapshot": f"http://{cam_ip}/capture",
     })
 
@@ -300,6 +326,17 @@ def api_alerts():
 #  BACKGROUND SCRAPER  (polls /data on sensor devices)
 # ══════════════════════════════════════════════════════════════════════
 
+def scrape_device(ip):
+    """Scrape one sensor device and return its data dict, or None on failure."""
+    try:
+        r = requests.get(f"http://{ip}/data", timeout=5)
+        if r.status_code == 200:
+            return r.json()
+    except Exception as e:
+        print(f"[SCRAPER] {ip} unreachable: {e}")
+    return None
+
+
 def scraper_loop():
     time.sleep(3)
     while True:
@@ -309,15 +346,12 @@ def scraper_loop():
 
         for ip, dev in ips:
             if dev.get("type") == "camera":
-                continue  # camera has no /data endpoint
-            try:
-                r = requests.get(f"http://{ip}/data", timeout=5)
-                if r.status_code == 200:
-                    with _lock:
-                        latest_data[ip] = r.json()
-                        devices[ip]["last_seen"] = now
-            except Exception:
-                print(f"[SCRAPER] {ip} unreachable")
+                continue
+            data = scrape_device(ip)
+            if data is not None:
+                with _lock:
+                    latest_data[ip] = data
+                    devices[ip]["last_seen"] = now
 
         # Evict timed-out devices
         with _lock:
@@ -331,6 +365,22 @@ def scraper_loop():
 
 
 threading.Thread(target=scraper_loop, daemon=True).start()
+
+
+@app.route("/scrape")
+def scrape_now():
+    now = time.time()
+    with _lock:
+        ips = list(devices.items())
+    for ip, dev in ips:
+        if dev.get("type") == "camera":
+            continue
+        data = scrape_device(ip)
+        if data is not None:
+            with _lock:
+                latest_data[ip] = data
+                devices[ip]["last_seen"] = now
+    return jsonify(latest_data)
 
 
 # ══════════════════════════════════════════════════════════════════════

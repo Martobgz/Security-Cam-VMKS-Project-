@@ -1,56 +1,58 @@
 /**
- * CameraFeed — polls /camera/snapshot every 350 ms and displays it.
- * Using snapshot polling instead of native MJPEG because React Native
- * does not support multipart streams in <Image>.
+ * CameraFeed — fetches the ESP32-CAM's direct IP from Flask,
+ * then streams MJPEG straight from the camera (no proxy lag).
  */
-import React, { useState, useEffect, useRef } from "react";
-import { View, Image, Text, ActivityIndicator, StyleSheet } from "react-native";
+import React, { useState, useEffect } from "react";
+import { View, Text, ActivityIndicator, StyleSheet } from "react-native";
+import { WebView } from "react-native-webview";
+import axios from "axios";
 import { SERVER_URL } from "../config";
 
+function buildHtml(streamUrl) {
+  return `<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    * { margin:0; padding:0; box-sizing:border-box; }
+    body { background:#000; display:flex; align-items:center; justify-content:center; height:100vh; overflow:hidden; }
+    img  { width:100%; height:100%; object-fit:contain; display:block; transform: rotate(180deg); }
+  </style>
+</head>
+<body>
+  <img src="${streamUrl}">
+</body>
+</html>`;
+}
+
 export default function CameraFeed() {
-  const [uri, setUri]           = useState(null);
-  const [online, setOnline]     = useState(false);
-  const [loading, setLoading]   = useState(true);
-  const intervalRef             = useRef(null);
+  const [streamUrl, setStreamUrl] = useState(null);
+  const [error, setError]         = useState(false);
 
   useEffect(() => {
-    let mounted = true;
+    let cancelled = false;
 
-    const poll = () => {
-      // Append timestamp to bust the cache on every request
-      const next = `${SERVER_URL}/camera/snapshot?t=${Date.now()}`;
-      Image.prefetch(next)
-        .then(() => {
-          if (!mounted) return;
-          setUri(next);
-          setOnline(true);
-          setLoading(false);
-        })
-        .catch(() => {
-          if (!mounted) return;
-          setOnline(false);
-          setLoading(false);
-        });
+    const resolve = async () => {
+      try {
+        // Ask Flask for the camera's direct IP
+        const res = await axios.get(`${SERVER_URL}/camera/url`, { timeout: 5000 });
+        if (cancelled) return;
+
+        if (res.data.stream) {
+          setStreamUrl(res.data.stream);   // e.g. http://192.168.0.14/stream
+        } else {
+          setError(true);
+        }
+      } catch {
+        if (!cancelled) setError(true);
+      }
     };
 
-    poll();
-    intervalRef.current = setInterval(poll, 350);
-    return () => {
-      mounted = false;
-      clearInterval(intervalRef.current);
-    };
+    resolve();
+    return () => { cancelled = true; };
   }, []);
 
-  if (loading) {
-    return (
-      <View style={styles.placeholder}>
-        <ActivityIndicator color="#00aaff" size="large" />
-        <Text style={styles.label}>Connecting to camera…</Text>
-      </View>
-    );
-  }
-
-  if (!online) {
+  if (error) {
     return (
       <View style={styles.placeholder}>
         <Text style={styles.offline}>📷 Camera offline</Text>
@@ -58,12 +60,25 @@ export default function CameraFeed() {
     );
   }
 
+  if (!streamUrl) {
+    return (
+      <View style={styles.placeholder}>
+        <ActivityIndicator color="#00aaff" size="large" />
+        <Text style={styles.loaderText}>Connecting to camera…</Text>
+      </View>
+    );
+  }
+
   return (
     <View style={styles.container}>
-      <Image
-        source={{ uri, cache: "reload" }}
-        style={styles.image}
-        resizeMode="contain"
+      <WebView
+        style={styles.webview}
+        originWhitelist={["*"]}
+        source={{ html: buildHtml(streamUrl) }}
+        scrollEnabled={false}
+        bounces={false}
+        mediaPlaybackRequiresUserAction={false}
+        allowsInlineMediaPlayback
       />
     </View>
   );
@@ -77,9 +92,9 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     overflow: "hidden",
   },
-  image: {
-    width: "100%",
-    height: "100%",
+  webview: {
+    flex: 1,
+    backgroundColor: "#000",
   },
   placeholder: {
     width: "100%",
@@ -90,7 +105,7 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     gap: 10,
   },
-  label: {
+  loaderText: {
     color: "#aaa",
     fontSize: 14,
   },

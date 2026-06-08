@@ -17,7 +17,8 @@
       "permissions": [
         "RECEIVE_BOOT_COMPLETED",
         "VIBRATE"
-      ]
+      ],
+      "package": "com.durjavnicite.securitycamapp"
     },
     "ios": {
       "supportsTablet": true
@@ -31,6 +32,11 @@
           "sounds": []
         }
       ]
-    ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "c6876c4d-0eaa-469a-835f-7f14a6b15f65"
+      }
+    }
   }
 }

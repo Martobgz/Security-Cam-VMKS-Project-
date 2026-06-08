@@ -12,9 +12,13 @@ function Card({ label, value, unit, danger }) {
   return (
     <View style={[styles.card, danger && styles.cardDanger]}>
       <Text style={styles.cardLabel}>{label}</Text>
-      <Text style={[styles.cardValue, danger && styles.valueDanger]}>
-        {value ?? "—"}
-        {unit ? <Text style={styles.unit}> {unit}</Text> : null}
+      <Text
+        style={[styles.cardValue, danger && styles.valueDanger]}
+        numberOfLines={1}
+        adjustsFontSizeToFit
+        minimumFontScale={0.6}
+      >
+        {value ?? "—"}{unit ? ` ${unit}` : ""}
       </Text>
     </View>
   );
@@ -59,11 +63,11 @@ export default function SensorData() {
           value={data.motion === 1 ? "DETECTED" : "Clear"}
           danger={data.motion === 1}
         />
-        <Card label="Light"  value={data.light}  unit="raw" />
-        <Card label="LPG"    value={data.lpg}    unit="ppm" danger={data.lpg   > DANGER.lpg}   />
-        <Card label="CO"     value={data.co}     unit="ppm" danger={data.co    > DANGER.co}    />
-        <Card label="Smoke"  value={data.smoke}  unit="ppm" danger={data.smoke > DANGER.smoke} />
-        <Card label="Servo"  value={data.servo}  unit="°"   />
+        <Card label="Light" value={data.light} unit="raw" />
+        <Card label="LPG"   value={data.lpg}   unit="ppm" danger={data.lpg   > DANGER.lpg}   />
+        <Card label="CO"    value={data.co}    unit="ppm" danger={data.co    > DANGER.co}    />
+        <Card label="Smoke" value={data.smoke} unit="ppm" danger={data.smoke > DANGER.smoke} />
+        <Card label="Servo" value={data.servo} unit="°"   />
       </View>
     </View>
   );
@@ -86,15 +90,14 @@ const styles = StyleSheet.create({
   grid: {
     flexDirection: "row",
     flexWrap: "wrap",
-    gap: 8,
   },
   card: {
     backgroundColor: "#1a1a1a",
     borderRadius: 8,
-    padding: 10,
-    minWidth: 90,
+    padding: 12,
+    margin: 4,
     flex: 1,
-    alignItems: "center",
+    minWidth: "44%",
   },
   cardDanger: {
     backgroundColor: "#3a1010",
@@ -105,18 +108,17 @@ const styles = StyleSheet.create({
     color: "#888",
     fontSize: 11,
     marginBottom: 4,
+    width: "100%",
+    textAlign: "center",
   },
   cardValue: {
     color: "#eee",
     fontSize: 16,
     fontWeight: "bold",
+    width: "100%",
+    textAlign: "center",
   },
   valueDanger: {
     color: "#ff6666",
-  },
-  unit: {
-    fontSize: 11,
-    color: "#888",
-    fontWeight: "normal",
   },
 });

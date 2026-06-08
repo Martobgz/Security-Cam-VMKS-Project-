@@ -32,7 +32,7 @@ function AlertItem({ item }) {
       <View style={styles.itemBody}>
         <Text style={[styles.itemType, { color }]}>
           {type === "gas"
-            ? `${item.gas} — ${item.ppm} ppm`
+            ? `${item.gas ?? "Gas"} — ${item.ppm ?? "?"} ppm`
             : type === "person"
             ? "Person detected"
             : "Motion detected"}

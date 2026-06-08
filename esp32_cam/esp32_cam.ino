@@ -12,6 +12,9 @@
 #include "esp_http_server.h"
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+#include "esp_task_wdt.h"
 #include "secrets.h"
 
 // ---------- AI-THINKER PIN MAP ----------
@@ -32,7 +35,8 @@
 #define HREF_GPIO_NUM  23
 #define PCLK_GPIO_NUM  22
 
-httpd_handle_t stream_httpd = NULL;
+httpd_handle_t stream_httpd  = NULL;  // port 81 — stream only
+httpd_handle_t camera_httpd  = NULL;  // port 80 — capture / future endpoints
 
 // =====================================================================
 //  MJPEG STREAM HANDLER
@@ -63,6 +67,9 @@ static esp_err_t stream_handler(httpd_req_t* req) {
 
     esp_camera_fb_return(fb);
     if (res != ESP_OK) break;
+
+    // Yield so the WiFi and IDLE tasks get CPU time (prevents watchdog reset)
+    vTaskDelay(10 / portTICK_PERIOD_MS);
   }
   return res;
 }
@@ -85,30 +92,39 @@ static esp_err_t capture_handler(httpd_req_t* req) {
 }
 
 // =====================================================================
-//  START HTTP SERVER
+//  START HTTP SERVERS
+//  Two separate servers so the blocking stream loop cannot starve /capture
 // =====================================================================
 void startCameraServer() {
-  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-  config.server_port    = 80;
-  config.ctrl_port      = 32768;
-
   httpd_uri_t stream_uri = {
-    .uri     = "/stream",
-    .method  = HTTP_GET,
-    .handler = stream_handler,
+    .uri      = "/stream",
+    .method   = HTTP_GET,
+    .handler  = stream_handler,
     .user_ctx = NULL
   };
   httpd_uri_t capture_uri = {
-    .uri     = "/capture",
-    .method  = HTTP_GET,
-    .handler = capture_handler,
+    .uri      = "/capture",
+    .method   = HTTP_GET,
+    .handler  = capture_handler,
     .user_ctx = NULL
   };
 
-  if (httpd_start(&stream_httpd, &config) == ESP_OK) {
+  // --- capture server on port 80 ---
+  httpd_config_t cam_cfg  = HTTPD_DEFAULT_CONFIG();
+  cam_cfg.server_port     = 80;
+  cam_cfg.ctrl_port       = 32768;
+  if (httpd_start(&camera_httpd, &cam_cfg) == ESP_OK) {
+    httpd_register_uri_handler(camera_httpd, &capture_uri);
+    Serial.println("Capture server started on :80");
+  }
+
+  // --- stream server on port 81 ---
+  httpd_config_t str_cfg  = HTTPD_DEFAULT_CONFIG();
+  str_cfg.server_port     = 81;
+  str_cfg.ctrl_port       = 32769;
+  if (httpd_start(&stream_httpd, &str_cfg) == ESP_OK) {
     httpd_register_uri_handler(stream_httpd, &stream_uri);
-    httpd_register_uri_handler(stream_httpd, &capture_uri);
-    Serial.println("Camera server started");
+    Serial.println("Stream  server started on :81");
   }
 }
 
@@ -139,6 +155,7 @@ void registerWithFlask() {
 //  SETUP
 // =====================================================================
 void setup() {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);  // disable brownout detector
   Serial.begin(115200);
   Serial.println("ESP32-CAM starting...");
 
@@ -165,21 +182,28 @@ void setup() {
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
 
-  if (psramFound()) {
-    config.frame_size   = FRAMESIZE_VGA;   // 640x480
-    config.jpeg_quality = 12;
-    config.fb_count     = 2;
-  } else {
-    config.frame_size   = FRAMESIZE_QVGA;  // 320x240
-    config.jpeg_quality = 15;
-    config.fb_count     = 1;
-  }
+  // Keep frame size small and buffer count at 1 for minimum latency.
+  // Higher jpeg_quality number = lower quality but faster encoding.
+  config.frame_size   = FRAMESIZE_QVGA;   // 320x240 — fastest
+  config.jpeg_quality = 12;
+  config.fb_count     = 2;               // 2 buffers: stream + capture can run concurrently
 
+  esp_task_wdt_deinit();  // disable watchdog during camera init — probe can take several seconds
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
     Serial.printf("Camera init failed: 0x%x\n", err);
-    return;
+    ESP.restart();  // restart instead of hanging
   }
+
+  // Fine-tune sensor
+  sensor_t* s = esp_camera_sensor_get();
+  s->set_brightness(s,  0);
+  s->set_contrast(s,    0);
+  s->set_saturation(s,  0);
+  s->set_whitebal(s,    1);
+  s->set_awb_gain(s,    1);
+  s->set_exposure_ctrl(s, 1);
+  s->set_aec2(s,        1);
 
   // WiFi
   WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -196,8 +220,8 @@ void setup() {
   registerWithFlask();
 
   Serial.println("Ready.");
-  Serial.printf("Stream  : http://%s/stream\n",  WiFi.localIP().toString().c_str());
-  Serial.printf("Capture : http://%s/capture\n", WiFi.localIP().toString().c_str());
+  Serial.printf("Stream  : http://%s:81/stream\n",  WiFi.localIP().toString().c_str());
+  Serial.printf("Capture : http://%s/capture\n",    WiFi.localIP().toString().c_str());
 }
 
 // =====================================================================

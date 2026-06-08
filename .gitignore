@@ -1,6 +1,22 @@
 # Created by https://www.toptal.com/developers/gitignore/api/flask
 # Edit at https://www.toptal.com/developers/gitignore?templates=flask
 
+# Claude Code
+.claude/
+
+# VS Code
+.vscode/
+
+# Node modules
+node_modules/
+package-lock.json
+
+# Expo
+mobile_app/.expo/
+
+# Debug artifacts
+flask/debug_capture.jpg
+
 ### Flask ###
 instance/*
 !instance/.gitignore
